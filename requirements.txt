@@ -1,0 +1,4 @@
+flask>=2.0
+requests>=2.22
+pandas>=2.0
+akshare>=1.10
