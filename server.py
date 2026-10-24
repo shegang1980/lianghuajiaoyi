@@ -12,6 +12,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__, static_folder="static", static_url_path="")
+app.json.sort_keys = False  # 保持指数返回顺序（A股 -> 港股 -> 美股）
 
 SINA_HDR = {
     "Referer": "https://finance.sina.com.cn",
@@ -99,9 +100,9 @@ def api_quote():
                 "time": parts[31] if len(parts) > 31 else "",
             })
         elif market == "hk":
-            # 英文名,中文名,昨收,今开,最高,最低,当前价,涨跌额,涨跌幅,买一,卖一,成交额,成交量,...
+            # 英文名,中文名,今开,昨收,最高,最低,当前价,涨跌额,涨跌幅,买一,卖一,成交额,成交量,...
             data.update({
-                "name": parts[1], "prev_close": parts[2], "open": parts[3],
+                "name": parts[1], "prev_close": parts[3], "open": parts[2],
                 "high": parts[4], "low": parts[5], "price": parts[6],
                 "change": parts[7], "change_pct": parts[8],
                 "bid": parts[9], "ask": parts[10], "amount": parts[11],
@@ -120,6 +121,80 @@ def api_quote():
             })
         result[c] = data
     return jsonify(result)
+
+
+# ============ 详细行情 / 基本面 (腾讯) ============
+@app.route("/api/detail")
+def api_detail():
+    """详细行情: 估值指标 + 五档盘口. 数据来自腾讯 qt.gtimg.cn"""
+    code = request.args.get("code", "")
+    if not code:
+        return jsonify({"error": "missing code"}), 400
+    key = f"detail_{code}"
+    cached = cache_get(key, ttl=3)
+    if cached is not None:
+        return jsonify(cached)
+    _, tc, market = parse_code(code)
+    qcode = tc.split(".")[0] if market == "us" else tc  # usAAPL.OQ -> usAAPL
+    try:
+        r = requests.get(f"https://qt.gtimg.cn/q={qcode}", headers=TENCENT_HDR, timeout=8)
+        r.encoding = "gbk"
+        m = re.search(r'="([^"]*)"', r.text)
+        if not m:
+            return jsonify({"error": "no data"}), 404
+        p = m.group(1).split("~")
+
+        def g(i):
+            return p[i] if i < len(p) else ""
+
+        def n(i):
+            try:
+                return float(p[i])
+            except Exception:
+                return None
+
+        d = {
+            "code": code, "market": market, "name": g(1),
+            "price": n(3), "prev_close": n(4), "open": n(5),
+            "change": n(31), "change_pct": n(32),
+            "high": n(33), "low": n(34),
+            "amplitude": n(43), "time": g(30),
+        }
+        if market == "a":
+            d.update({
+                "volume": n(6), "volume_unit": "手",
+                "amount": (n(37) or 0) * 1e4, "amount_unit": "元",
+                "turnover_rate": n(38), "pe": n(39), "pb": n(46),
+                "circ_mktcap": n(44), "total_mktcap": n(45), "mktcap_unit": "亿元",
+                "limit_up": n(47), "limit_down": n(48),
+                "week52_high": n(67), "week52_low": n(68),
+            })
+            bids = [{"price": n(9 + 2 * k), "volume": n(10 + 2 * k)} for k in range(5)]
+            asks = [{"price": n(19 + 2 * k), "volume": n(20 + 2 * k)} for k in range(5)]
+        elif market == "hk":
+            d.update({
+                "volume": n(6), "volume_unit": "股",
+                "amount": n(37), "amount_unit": "HKD",
+                "pe": n(39), "total_mktcap": n(45), "mktcap_unit": "亿HKD",
+                "week52_high": n(48), "week52_low": n(49),
+            })
+            bids = [{"price": n(9 + 2 * k), "volume": n(10 + 2 * k)} for k in range(5)]
+            asks = [{"price": n(19 + 2 * k), "volume": n(20 + 2 * k)} for k in range(5)]
+        else:
+            d.update({
+                "volume": n(6), "volume_unit": "股",
+                "amount": n(37), "amount_unit": "USD",
+                "pe": n(39), "total_mktcap": n(45), "mktcap_unit": "亿USD",
+                "week52_high": n(48), "week52_low": n(49),
+            })
+            bids = [{"price": n(9), "volume": n(10)}]
+            asks = [{"price": n(19), "volume": n(20)}]
+        d["bids"] = [b for b in bids if b.get("price") and b.get("volume")]
+        d["asks"] = [a for a in asks if a.get("price") and a.get("volume")]
+        cache_set(key, d)
+        return jsonify(d)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ============ K线 (腾讯) ============
@@ -171,11 +246,27 @@ def api_minute():
         d = js.get("data", {}).get(tc, {}).get("data", {})
         rows = d.get("data", [])
         points = []
+        prev_cum = 0.0
         for row in rows:
             parts = row.split()
-            if len(parts) >= 3:
-                points.append({"time": parts[0], "price": parts[1],
-                               "volume": parts[2]})
+            if len(parts) < 3:
+                continue
+            t = parts[0]
+            # 过滤超出交易时段的冗余数据
+            if market == "a" and t > "1500":
+                continue
+            if market == "hk" and t > "1600":
+                continue
+            try:
+                cum = float(parts[2])
+            except Exception:
+                cum = 0.0
+            vol = cum - prev_cum
+            if vol < 0:
+                vol = cum
+            prev_cum = cum
+            points.append({"time": f"{t[:2]}:{t[2:]}", "price": parts[1],
+                           "volume": round(vol, 2)})
         return jsonify({"market": market, "points": points, "raw": d})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -271,8 +362,18 @@ def api_indices():
         if not parts:
             continue
         if code.startswith("sh") or code.startswith("sz"):
-            result[code] = {"name": name, "price": parts[3], "change": parts[31] if len(parts) > 31 else "",
-                            "change_pct": parts[32] if len(parts) > 32 else "", "volume": parts[8], "amount": parts[9]}
+            # 新浪指数格式无涨跌字段，用现价与昨收计算
+            try:
+                price = float(parts[3])
+                prev = float(parts[2])
+                chg = price - prev
+                pct = (chg / prev * 100) if prev else 0
+                result[code] = {"name": name, "price": f"{price:.2f}",
+                                "change": f"{chg:.2f}", "change_pct": f"{pct:.2f}",
+                                "volume": parts[8], "amount": parts[9]}
+            except Exception:
+                result[code] = {"name": name, "price": parts[3], "change": "",
+                                "change_pct": "", "volume": parts[8], "amount": parts[9]}
         elif "hkHSI" in code or "hkHSCEI" in code:
             result[code] = {"name": name, "price": parts[6], "change": parts[7], "change_pct": parts[8]}
         else:
@@ -281,10 +382,14 @@ def api_indices():
 
 
 # ============ 搜索 ============
-@app.route("/api/search")
+@app.route("/api/search", methods=["GET", "POST"])
 def api_search():
-    """简单搜索, 返回匹配的热门标的"""
-    q = request.args.get("q", "").strip().lower()
+    """简单搜索, 返回匹配的热门标的. 支持 GET(q) 与 POST JSON({"q": ...})"""
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        q = str(payload.get("q", "")).strip().lower()
+    else:
+        q = request.args.get("q", "").strip().lower()
     if not q:
         return jsonify([])
     popular = [
@@ -321,7 +426,10 @@ def api_search():
 
 @app.route("/")
 def index():
-    return send_from_directory("static", "index.html")
+    resp = send_from_directory("static", "index.html")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 if __name__ == "__main__":

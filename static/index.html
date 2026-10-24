@@ -173,6 +173,8 @@ document.querySelectorAll('.tab').forEach(t=>{
     t.classList.add('active');
     $('#p-'+t.dataset.p).classList.add('active');
     if(t.dataset.p==='review') loadReview();
+    if(t.dataset.p==='fund') loadFund(currentCode);
+    if(t.dataset.p==='quote') setTimeout(()=>chartMain && chartMain.resize(), 0);
   };
 });
 
@@ -191,6 +193,8 @@ document.querySelectorAll('.m-tab').forEach(t=>{
   t.onclick = ()=>{
     document.querySelectorAll('.m-tab').forEach(x=>x.classList.remove('active'));
     t.classList.add('active');
+    const def = {a:'600519', hk:'00700', us:'AAPL'}[t.dataset.m];
+    if(def) selectStock(def);
   };
 });
 
@@ -202,7 +206,12 @@ $('#search').addEventListener('input', e=>{
   if(!q){ $('#suggest').style.display='none'; return; }
   searchTimer.t = setTimeout(async()=>{
     try{
-      const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+      // 用 POST 提交，避免中文查询串被中间层错误编码
+      const r = await fetch('/api/search', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({q})
+      });
       const data = await r.json();
       if(data.length){
         $('#suggest').innerHTML = data.map(s=>`<div data-code="${s.code}" data-market="${s.market}"><span>${s.name}</span><span class="tag">${s.market==='a'?'A股':s.market==='hk'?'港股':'美股'} ${s.code}</span></div>`).join('');
@@ -216,10 +225,21 @@ $('#search').addEventListener('input', e=>{
 });
 document.addEventListener('click', e=>{ if(!e.target.closest('.search-box')) $('#suggest').style.display='none'; });
 
+function marketOf(code){
+  const c = String(code).toLowerCase();
+  if(/^[a-z]/.test(c) && !/^(sh|sz|bj|hk)/.test(c)) return 'us';
+  if(/^hk/.test(c) || /^\d{5}$/.test(c)) return 'hk';
+  return 'a';
+}
+
 function selectStock(code){
   currentCode = code;
+  const mk = marketOf(code);
+  document.querySelectorAll('.m-tab').forEach(x=>x.classList.toggle('active', x.dataset.m===mk));
   loadQuote();
   loadChart();
+  loadDetail();
+  if($('#p-fund').classList.contains('active')) loadFund(code);
 }
 
 // 加载行情
@@ -263,6 +283,34 @@ async function loadQuote(){
     }
     $('#s-metrics').innerHTML = met.map(([l,v])=>`<div class="metric"><div class="label">${l}</div><div class="value">${v??'--'}</div></div>`).join('');
   }catch(e){ console.error(e); }
+}
+
+// 详细行情 / 五档盘口
+async function loadDetail(){
+  try{
+    const r = await fetch(`/api/detail?code=${currentCode}`);
+    const d = await r.json();
+    renderBook(d && !d.error ? d : null);
+  }catch(e){ renderBook(null); }
+}
+
+function renderBook(d){
+  const el = $('#orderbook');
+  if(!el) return;
+  if(!d){ el.innerHTML = '<div style="color:#8b949e;padding:20px">盘口数据加载失败</div>'; return; }
+  const prev = parseFloat(d.prev_close) || 0;
+  const unit = d.volume_unit || '';
+  const line = (label, price, vol) => {
+    const c = cls(parseFloat(price) - prev);
+    return `<div style="display:flex;justify-content:space-between;padding:6px 8px;border-bottom:1px solid #21262d;font-size:13px">
+      <span style="color:#8b949e">${label}</span><span class="${c}">${price==null?'--':fmt(price)}</span><span>${fmt(vol,0)}</span></div>`;
+  };
+  let html = `<div style="display:flex;justify-content:space-between;padding:4px 8px;color:#8b949e;font-size:12px"><span>档位</span><span>价格</span><span>数量(${unit})</span></div>`;
+  const asks = d.asks || [], bids = d.bids || [];
+  asks.slice().reverse().forEach((a,i)=> html += line(`卖${asks.length-i}`, a.price, a.volume));
+  bids.forEach((b,i)=> html += line(`买${i+1}`, b.price, b.volume));
+  if(!asks.length && !bids.length) html += '<div style="color:#8b949e;padding:20px">该市场暂不提供五档盘口</div>';
+  el.innerHTML = html;
 }
 
 // 加载图表
@@ -351,13 +399,15 @@ async function loadReview(){
     const sec = await r.json();
     if(sec.error){ $('#sector-up').innerHTML='<div style="color:#8b949e;padding:20px">数据加载失败</div>'; }
     else {
-      const render = (list,reverse)=> list.slice(reverse?0:list.length-10, reverse?10:list.length).reverse().map(s=>{
+      const render = list => list.length ? list.map(s=>{
         const c = cls(s.change_pct);
         return `<div class="sector-item" style="background:${s.change_pct>0?'rgba(248,81,73,0.1)':'rgba(63,185,80,0.1)'}">
           <span>${s.name}</span><span class="${c}">${sign(s.change_pct)}${fmt(s.change_pct)}%</span></div>`;
-      }).join('');
-      $('#sector-up').innerHTML = render(sec,true);
-      $('#sector-down').innerHTML = render(sec,false);
+      }).join('') : '<div style="color:#8b949e;padding:20px">暂无数据</div>';
+      const upList = sec.filter(s=>s.change_pct>0).slice(0,10);
+      const downList = sec.filter(s=>s.change_pct<0).sort((a,b)=>a.change_pct-b.change_pct).slice(0,10);
+      $('#sector-up').innerHTML = render(upList);
+      $('#sector-down').innerHTML = render(downList);
     }
   }catch(e){}
   // 涨跌榜
@@ -370,25 +420,57 @@ async function loadReview(){
 }
 
 // 基本面
-async function loadFund(){
-  const main = [
-    ['股票代码', currentCode], ['市场', currentCode.length===6?'A股':(currentCode.length===5?'港股':'美股')],
-    ['数据来源', '新浪财经 / 腾讯财经'], ['更新频率', '实时 (交易时段)'],
-    ['K线周期', '分时 / 日 / 周 / 月'], ['复权方式', '前复权'],
-  ];
-  const val = [
-    ['说明', '本面板基于公开免费行情接口，提供行情、复盘、K线等核心功能。'],
-    ['免责声明', '数据仅供参考，不构成投资建议。'],
-    ['建议', '重要决策请以官方行情源为准。'],
-    ['支持标的', 'A股 / 港股 / 美股'],
-  ];
-  $('#fund-main').innerHTML = main.map(([l,v])=>`<tr><td class="lbl">${l}</td><td>${v}</td></tr>`).join('');
-  $('#fund-val').innerHTML = val.map(([l,v])=>`<tr><td class="lbl">${l}</td><td>${v}</td></tr>`).join('');
+async function loadFund(code){
+  $('#fund-main').innerHTML = '<tr><td class="lbl">加载中...</td><td></td></tr>';
+  $('#fund-val').innerHTML = '';
+  try{
+    const r = await fetch(`/api/detail?code=${code}`);
+    const d = await r.json();
+    if(!d || d.error){
+      $('#fund-main').innerHTML = '<tr><td class="lbl">数据加载失败</td><td></td></tr>';
+      return;
+    }
+    const money = v => v==null ? '--' : fmt(v);
+    const unit = {a:'A股', hk:'港股', us:'美股'}[d.market] || '--';
+    const cur = d.amount_unit==='HKD' ? '港元' : (d.amount_unit==='USD' ? '美元' : '元');
+    const main = [
+      ['股票名称', d.name || '--'],
+      ['股票代码', String(code).toUpperCase()],
+      ['市场', unit],
+      ['最新价', money(d.price)],
+      ['涨跌额', d.change==null ? '--' : `${sign(d.change)}${fmt(d.change)}`],
+      ['涨跌幅', d.change_pct==null ? '--' : `${sign(d.change_pct)}${fmt(d.change_pct)}%`],
+      ['今开 / 昨收', `${money(d.open)} / ${money(d.prev_close)}`],
+      ['最高 / 最低', `${money(d.high)} / ${money(d.low)}`],
+      ['成交量', d.volume==null ? '--' : `${fmt(d.volume,0)} ${d.volume_unit||''}`],
+      ['成交额', d.amount==null ? '--' : `${fmt(d.amount/1e8,2)} 亿${cur}`],
+      ['振幅', d.amplitude==null ? '--' : `${fmt(d.amplitude)}%`],
+      ['行情时间', d.time || '--'],
+    ];
+    const val = [
+      ['市盈率 (TTM)', d.pe==null ? '--（该市场未提供）' : fmt(d.pe)],
+      ['市净率', d.pb==null ? '--（该市场未提供）' : fmt(d.pb)],
+      ['换手率', d.turnover_rate==null ? '--（该市场未提供）' : `${fmt(d.turnover_rate)}%`],
+      ['总市值', d.total_mktcap==null ? '--' : `${fmt(d.total_mktcap)} ${d.mktcap_unit||''}`],
+      ['流通市值', d.circ_mktcap==null ? '--' : `${fmt(d.circ_mktcap)} 亿元`],
+      ['52周最高', money(d.week52_high)],
+      ['52周最低', money(d.week52_low)],
+      ['涨停价', d.limit_up==null ? '--' : fmt(d.limit_up)],
+      ['跌停价', d.limit_down==null ? '--' : fmt(d.limit_down)],
+      ['数据来源', '腾讯财经（实时快照）'],
+    ];
+    const rows = arr => arr.map(([l,v])=>`<tr><td class="lbl">${l}</td><td>${v}</td></tr>`).join('');
+    $('#fund-main').innerHTML = rows(main);
+    $('#fund-val').innerHTML = rows(val) + '<tr><td class="lbl">免责声明</td><td style="color:#8b949e">数据仅供参考，不构成投资建议</td></tr>';
+  }catch(e){
+    $('#fund-main').innerHTML = '<tr><td class="lbl">数据加载失败</td><td></td></tr>';
+  }
 }
 
 // 初始化
 selectStock('600519');
-setInterval(loadQuote, 5000); // 5秒刷新行情
+setInterval(loadQuote, 5000);   // 5秒刷新行情
+setInterval(loadDetail, 5000);  // 5秒刷新盘口
 window.addEventListener('resize', ()=> chartMain && chartMain.resize());
 </script>
 </body>
